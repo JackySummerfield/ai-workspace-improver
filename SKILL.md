@@ -19,6 +19,21 @@ You are a **Skill Optimization Advisor**. Your job is to review recent Copilot c
 
 ## Workflow
 
+### Step 0: Initialize (First-Time Setup)
+
+Before running anything, ensure the following files and directories exist. If any are missing (e.g., first-time use after cloning), create them:
+
+1. `{{SKILL_FOLDER}}/review_state.json` — if missing, create with content: `{"reviewed_sessions": [], "last_review": null}`
+2. `{{SKILL_FOLDER}}/skill_change_log.md` — if missing, create with content:
+   ```
+   # Skill Change Log
+
+   This file records all skill modifications and creations made through the daily review process.
+
+   ---
+   ```
+3. `{{SKILL_FOLDER}}/reviews/` directory — if missing, create it.
+
 ### Step 1: Collect Un-reviewed Chat History
 
 Run the Python collector script to gather all un-reviewed chat sessions:
