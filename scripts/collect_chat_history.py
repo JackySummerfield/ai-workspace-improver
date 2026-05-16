@@ -39,7 +39,7 @@ def load_review_state(state_file: str) -> dict:
                 return json.load(f)
         except (json.JSONDecodeError, IOError):
             pass
-    return {"reviewed_sessions": [], "last_review": None}
+    return {"reviewed_sessions": {}, "last_review": None}
 
 
 def save_review_state(state_file: str, state: dict):
@@ -96,14 +96,22 @@ def load_workspace_mapping(global_storage: str) -> dict:
     return mapping
 
 
-def parse_transcript(filepath: str, max_assistant_chars: int = 200) -> dict | None:
-    """Parse a JSONL transcript file and extract conversation summary."""
+def parse_transcript(filepath: str, max_assistant_chars: int = 200, skip_lines: int = 0) -> dict | None:
+    """Parse a JSONL transcript file and extract conversation summary.
+    
+    Args:
+        skip_lines: Number of lines already reviewed. Only parse lines after this offset.
+    """
     session_id = Path(filepath).stem
     events = []
+    total_lines = 0
 
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             for line_num, line in enumerate(f, 1):
+                total_lines = line_num
+                if line_num <= skip_lines:
+                    continue
                 line = line.strip()
                 if not line:
                     continue
@@ -128,6 +136,8 @@ def parse_transcript(filepath: str, max_assistant_chars: int = 200) -> dict | No
         "messages": [],
         "tools_used": set(),
         "topics": [],
+        "total_lines": total_lines,
+        "is_incremental": skip_lines > 0,
     }
 
     for event in events:
@@ -193,7 +203,8 @@ def format_session_markdown(session: dict, workspace_name: str) -> str:
     except (ValueError, AttributeError):
         start_formatted = str(start)
 
-    lines.append(f"### Session: {session['session_id'][:8]}...")
+    incremental_tag = " (incremental)" if session.get("is_incremental") else ""
+    lines.append(f"### Session: {session['session_id'][:8]}...{incremental_tag}")
     lines.append(f"- **Time**: {start_formatted}")
     lines.append(f"- **Workspace**: {workspace_name}")
 
@@ -248,7 +259,13 @@ def main():
 
     # Load review state
     state = load_review_state(args.state_file)
-    reviewed_set = set(state.get("reviewed_sessions", []))
+    # Support both old format (list) and new format (dict with line counts)
+    raw_reviewed = state.get("reviewed_sessions", {})
+    if isinstance(raw_reviewed, list):
+        # Migrate old format: list of IDs -> dict with 0 lines (will re-scan fully)
+        reviewed_dict = {sid: 0 for sid in raw_reviewed}
+    else:
+        reviewed_dict = raw_reviewed
 
     # Load workspace mappings
     workspace_mapping = load_workspace_mapping(global_storage)
@@ -263,23 +280,33 @@ def main():
         print("# No Chat History Found\n\nNo JSONL transcript files found in any workspace.", flush=True)
         sys.exit(0)
 
-    # Filter out already-reviewed sessions
-    new_transcripts = []
+    # Check each transcript: new sessions OR sessions with new content
+    transcripts_to_review = []  # (filepath, skip_lines)
     for tf in transcript_files:
         session_id = Path(tf).stem
-        if session_id not in reviewed_set:
-            new_transcripts.append(tf)
+        if session_id not in reviewed_dict:
+            # Completely new session
+            transcripts_to_review.append((tf, 0))
+        else:
+            # Already reviewed — check if file has grown
+            reviewed_lines = reviewed_dict[session_id]
+            try:
+                current_lines = sum(1 for _ in open(tf, "r", encoding="utf-8"))
+            except (IOError, PermissionError):
+                continue
+            if current_lines > reviewed_lines:
+                transcripts_to_review.append((tf, reviewed_lines))
 
-    if not new_transcripts:
+    if not transcripts_to_review:
         last_review = state.get("last_review", "N/A")
         print(f"# No New Chat History\n\nAll sessions have been reviewed. Last review: {last_review}", flush=True)
         sys.exit(0)
 
     # Parse and group by workspace
     workspace_sessions = {}  # workspace_storage_id -> list of sessions
-    new_session_ids = []
+    new_session_ids = []  # list of (session_id, total_lines)
 
-    for tf in new_transcripts:
+    for tf, skip_lines in transcripts_to_review:
         # Extract workspace storage ID from path
         parts = Path(tf).parts
         # Find the part that comes right before "GitHub.copilot-chat"
@@ -289,12 +316,12 @@ def main():
         except (ValueError, IndexError):
             ws_storage_id = "unknown"
 
-        session = parse_transcript(tf, max_assistant_chars=args.max_assistant_chars)
+        session = parse_transcript(tf, max_assistant_chars=args.max_assistant_chars, skip_lines=skip_lines)
         if session:
             if ws_storage_id not in workspace_sessions:
                 workspace_sessions[ws_storage_id] = []
             workspace_sessions[ws_storage_id].append(session)
-            new_session_ids.append(session["session_id"])
+            new_session_ids.append((session["session_id"], session["total_lines"]))
 
     if not workspace_sessions:
         print("# No New Chat History\n\nFound transcript files but no parseable messages.", flush=True)
@@ -302,7 +329,9 @@ def main():
 
     # Mark as reviewed BEFORE output (so broken pipe won't skip it)
     if args.mark_reviewed and new_session_ids:
-        state["reviewed_sessions"] = list(reviewed_set | set(new_session_ids))
+        for sid, lines in new_session_ids:
+            reviewed_dict[sid] = lines
+        state["reviewed_sessions"] = reviewed_dict
         save_review_state(args.state_file, state)
 
     # Output Markdown summary
@@ -333,7 +362,7 @@ def main():
         print(f"")
 
         # Sort sessions by start time
-        sessions.sort(key=lambda s: s.get("start_time", ""))
+        sessions.sort(key=lambda s: s.get("start_time") or "")
 
         for session in sessions:
             print(format_session_markdown(session, ws_name))
@@ -341,7 +370,14 @@ def main():
             print("")
 
     if args.mark_reviewed and new_session_ids:
-        print(f"\n<!-- Marked {len(new_session_ids)} sessions as reviewed -->", flush=True)
+        incremental = sum(1 for s in workspace_sessions.values() for sess in s if sess.get("is_incremental"))
+        fresh = len(new_session_ids) - incremental
+        parts = []
+        if fresh:
+            parts.append(f"{fresh} new")
+        if incremental:
+            parts.append(f"{incremental} incremental")
+        print(f"\n<!-- Marked {' + '.join(parts)} sessions as reviewed -->", flush=True)
 
     sys.stdout.flush()
 
