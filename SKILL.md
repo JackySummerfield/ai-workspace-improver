@@ -174,8 +174,16 @@ For each approved suggestion:
 #### For New Skills:
 1. Create the skill directory under `~/.copilot/skills/[skill-name]/`
 2. Create the `SKILL.md` with proper YAML frontmatter and workflow body
-3. Create any necessary `references/` files
-4. Log the creation in the change log
+3. Create a `README.md` following the [Best-README-Template](https://github.com/othneildrew/Best-README-Template) structure. Include these sections (adapt as needed):
+   - **About** — What the skill does, one-paragraph summary
+   - **Getting Started / Prerequisites** — Dependencies, environment requirements
+   - **Usage** — Example trigger phrases and expected behavior
+   - **Workflow Overview** — Brief description of each workflow step
+   - **File Structure** — Tree of the skill directory contents
+   - **Roadmap** — Planned improvements (optional)
+   - **Acknowledgments** — References, inspiration sources (optional)
+4. Create any necessary `references/` files
+5. Log the creation in the change log
 
 #### For Knowledge Nuggets:
 1. If target file exists under `~/.copilot/knowledge/`:
