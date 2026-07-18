@@ -8,6 +8,7 @@ never stores chat content.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -17,7 +18,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-STATE_VERSION = 3
+STATE_VERSION = 5
 SOURCES = ("copilot", "codex")
 DEFAULT_MAX_MESSAGE_CHARS = 300
 
@@ -27,6 +28,14 @@ class Message:
     role: str
     content: str
     timestamp: str = ""
+
+
+@dataclass(frozen=True)
+class RuntimeIncident:
+    """A privacy-safe classification of tool friction, never raw tool output."""
+
+    category: str
+    recovered: bool = False
 
 
 @dataclass
@@ -42,6 +51,7 @@ class Session:
     workspace: str = ""
     messages: list[Message] = field(default_factory=list)
     tools_used: set[str] = field(default_factory=set)
+    runtime_incidents: list[RuntimeIncident] = field(default_factory=list)
     total_lines: int = 0
     skip_lines: int = 0
 
@@ -68,6 +78,7 @@ class ReviewSession:
     workspace: str
     messages: list[Message]
     tools_used: set[str]
+    runtime_incidents: list[RuntimeIncident]
 
     @property
     def segment_count(self) -> int:
@@ -122,10 +133,29 @@ def content_to_text(content: Any) -> str:
     if isinstance(content, list):
         return "\n".join(filter(None, (content_to_text(item) for item in content)))
     if isinstance(content, dict):
-        for key in ("text", "input_text", "output_text"):
+        for key in ("text", "input_text", "output_text", "output", "error", "message", "result"):
             if isinstance(content.get(key), str):
                 return content[key]
     return ""
+
+
+def classify_runtime_incidents(value: Any) -> list[RuntimeIncident]:
+    """Classify known tool failures without retaining commands or error text."""
+    if not isinstance(value, (str, dict, list)):
+        return []
+    text = redact_text(content_to_text(value) if isinstance(value, dict) else str(value)).lower()
+    if not text:
+        return []
+    incidents: list[RuntimeIncident] = []
+    if any(marker in text for marker in ("operation not permitted", "permission denied", "sandbox")):
+        incidents.append(RuntimeIncident("sandbox_permission"))
+    if any(marker in text for marker in ("fetch failed", "dns", "network is unreachable", "could not resolve", "connection refused")):
+        incidents.append(RuntimeIncident("network"))
+    if "require_escalated" in text or ("approval" in text and "permission" in text):
+        incidents.append(RuntimeIncident("permission_escalation", recovered=True))
+    if any(marker in text for marker in ("exit code", "non-zero", "command failed")):
+        incidents.append(RuntimeIncident("tool_failure"))
+    return incidents
 
 
 def default_source_state() -> dict[str, dict[str, int] | dict[str, str]]:
@@ -137,6 +167,9 @@ def default_state() -> dict[str, Any]:
         "schema_version": STATE_VERSION,
         "sources": {source: default_source_state() for source in SOURCES},
         "last_review": None,
+        "pending_reviews": {},
+        "completed_reviews": 0,
+        "last_deep_audit_review": 0,
     }
 
 
@@ -162,6 +195,12 @@ def normalize_state(raw: dict[str, Any] | None) -> dict[str, Any]:
         if isinstance(reviewed, dict):
             state["sources"]["copilot"]["reviewed_segments"] = reviewed
     state["last_review"] = raw.get("last_review")
+    if isinstance(raw.get("pending_reviews"), dict):
+        state["pending_reviews"] = raw["pending_reviews"]
+    if isinstance(raw.get("completed_reviews"), int):
+        state["completed_reviews"] = raw["completed_reviews"]
+    if isinstance(raw.get("last_deep_audit_review"), int):
+        state["last_deep_audit_review"] = raw["last_deep_audit_review"]
     return state
 
 
@@ -280,6 +319,7 @@ def parse_copilot_transcript(path: Path, max_message_chars: int, skip_lines: int
                     segment.tools_used.add(str(request["toolName"]))
         elif event_type == "tool.execution_complete" and data.get("toolName"):
             segment.tools_used.add(str(data["toolName"]))
+            segment.runtime_incidents.extend(classify_runtime_incidents(data.get("result", data.get("error", ""))))
         segment.end_time = timestamp or segment.end_time
     return segment if segment.messages else None
 
@@ -312,6 +352,8 @@ def parse_codex_transcript(path: Path, max_message_chars: int, skip_lines: int =
                     primary_messages.append(Message(str(payload["role"]), content, timestamp))
             elif item_type in {"function_call", "custom_tool_call"} and payload.get("name"):
                 segment.tools_used.add(str(payload["name"]))
+            elif item_type in {"function_call_output", "custom_tool_call_output"}:
+                segment.runtime_incidents.extend(classify_runtime_incidents(payload.get("output", payload.get("content", ""))))
         elif event_type == "event_msg":
             item_type = payload.get("type")
             if item_type in {"user_message", "agent_message"}:
@@ -320,6 +362,8 @@ def parse_codex_transcript(path: Path, max_message_chars: int, skip_lines: int =
                     fallback_messages.append(Message("user" if item_type == "user_message" else "assistant", content, timestamp))
             elif isinstance(item_type, str) and item_type.endswith("_tool_call"):
                 segment.tools_used.add(item_type)
+            elif item_type in {"tool_result", "tool_error", "command_error"}:
+                segment.runtime_incidents.extend(classify_runtime_incidents(payload.get("message", payload.get("output", payload.get("error", "")))))
         segment.end_time = timestamp or segment.end_time
     segment.messages = primary_messages or fallback_messages
     return segment if segment.messages else None
@@ -388,6 +432,7 @@ def aggregate_segments(segments: Iterable[Session]) -> list[ReviewSession]:
             workspace=next((segment.workspace for segment in ordered_segments if segment.workspace), ""),
             messages=messages,
             tools_used=set().union(*(segment.tools_used for segment in ordered_segments)),
+            runtime_incidents=[incident for segment in ordered_segments for incident in segment.runtime_incidents],
         ))
     return sorted(reviews, key=lambda item: (timestamp_sort_key(item.start_time), item.source, item.session_id))
 
@@ -437,6 +482,54 @@ def mark_reviewed(state: dict[str, Any], sessions: Iterable[ReviewSession]) -> N
                 source_state["segment_sessions"][segment.state_key] = segment.session_id
 
 
+def create_review_snapshot(state: dict[str, Any], sessions: Iterable[ReviewSession]) -> str:
+    """Store only cursor ceilings so delivery can finish in a later turn."""
+    captured = [
+        {
+            "source": review.source,
+            "session_id": review.session_id if review.identity_known else "",
+            "segments": [
+                {"key": segment.state_key, "lines": segment.total_lines, "session_id": segment.session_id if segment.identity_known else ""}
+                for segment in review.segments
+            ],
+        }
+        for review in sessions
+    ]
+    digest = hashlib.sha256(json.dumps(captured, sort_keys=True).encode()).hexdigest()[:12]
+    review_id = f"review-{utc_now().strftime('%Y%m%d%H%M%S')}-{digest}"
+    state["pending_reviews"][review_id] = {"created_at": utc_now().isoformat(), "sessions": captured}
+    return review_id
+
+
+def finalize_review_snapshot(state: dict[str, Any], review_id: str) -> bool:
+    snapshot = state["pending_reviews"].pop(review_id, None)
+    if not isinstance(snapshot, dict):
+        return False
+    for review in snapshot.get("sessions", []):
+        if not isinstance(review, dict) or review.get("source") not in SOURCES:
+            continue
+        source_state = state["sources"][review["source"]]
+        for segment in review.get("segments", []):
+            if not isinstance(segment, dict) or not isinstance(segment.get("key"), str):
+                continue
+            previous = int(source_state["reviewed_segments"].get(segment["key"], 0))
+            source_state["reviewed_segments"][segment["key"]] = max(previous, int(segment.get("lines", 0)))
+            if segment.get("session_id"):
+                source_state["segment_sessions"][segment["key"]] = segment["session_id"]
+    state["completed_reviews"] += 1
+    return True
+
+
+def deep_audit_status(state: dict[str, Any], include_current_review: bool = True) -> dict[str, int | bool]:
+    completed = int(state.get("completed_reviews", 0)) + int(include_current_review)
+    last_deep = int(state.get("last_deep_audit_review", 0))
+    return {"due": completed - last_deep >= 5, "completed_reviews": completed, "last_deep_audit_review": last_deep}
+
+
+def record_deep_audit(state: dict[str, Any]) -> None:
+    state["last_deep_audit_review"] = int(state.get("completed_reviews", 0))
+
+
 def format_session_markdown(session: ReviewSession, workspace_name: str | None = None) -> str:
     start = parse_time(session.start_time)
     formatted = start.strftime("%Y-%m-%d %H:%M") if start else (session.start_time or "Unknown")
@@ -451,6 +544,11 @@ def format_session_markdown(session: ReviewSession, workspace_name: str | None =
     ]
     if session.tools_used:
         lines.append(f"- **Tools Used**: {', '.join(sorted(session.tools_used))}")
+    if session.runtime_incidents:
+        counts: dict[str, int] = {}
+        for incident in session.runtime_incidents:
+            counts[incident.category] = counts.get(incident.category, 0) + 1
+        lines.append("- **Runtime incidents**: " + ", ".join(f"{name} ×{count}" for name, count in sorted(counts.items())))
     lines.extend(["", "#### Bounded transcript excerpt", ""])
     for item in session.messages:
         label = "User" if item.role == "user" else "Assistant"
@@ -461,7 +559,12 @@ def format_session_markdown(session: ReviewSession, workspace_name: str | None =
 def main() -> int:
     parser = argparse.ArgumentParser(description="Collect bounded logical Copilot and Codex review sessions")
     parser.add_argument("--state-file", default=str(Path(__file__).resolve().parents[1] / "review_state.json"))
-    parser.add_argument("--mark-reviewed", action="store_true", help="Advance cursors for every collected transcript segment")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--mark-reviewed", action="store_true", help="Legacy: immediately advance cursors for collected segments")
+    mode.add_argument("--prepare-review", action="store_true", help="Create a delivery snapshot without advancing cursors")
+    mode.add_argument("--finalize-review", metavar="REVIEW_ID", help="Advance only the cursor ceilings stored in a delivery snapshot")
+    parser.add_argument("--deep-audit-status", action="store_true", help="Print whether the current review is due for a deep asset audit")
+    parser.add_argument("--record-deep-audit", action="store_true", help="Record that the current deep asset audit has completed")
     parser.add_argument("--source", choices=("all", *SOURCES), default="all")
     parser.add_argument("--lookback-days", type=int, default=90, help="Initial-history window; later runs are incremental")
     parser.add_argument("--max-message-chars", type=int, default=DEFAULT_MAX_MESSAGE_CHARS)
@@ -469,7 +572,22 @@ def main() -> int:
     args = parser.parse_args()
     if args.lookback_days < 1 or args.max_message_chars < 1:
         parser.error("lookback and message limits must be positive")
-    sessions = collect_sessions(args.source, load_review_state(args.state_file), args.lookback_days, args.legacy_message_chars or args.max_message_chars)
+    state = load_review_state(args.state_file)
+    if args.deep_audit_status:
+        print(json.dumps(deep_audit_status(state), ensure_ascii=False))
+        return 0
+    if args.record_deep_audit:
+        record_deep_audit(state)
+        save_review_state(args.state_file, state)
+        print("<!-- Recorded deep asset audit -->")
+        return 0
+    if args.finalize_review:
+        if not finalize_review_snapshot(state, args.finalize_review):
+            parser.error(f"unknown review snapshot: {args.finalize_review}")
+        save_review_state(args.state_file, state)
+        print(f"<!-- Finalized review snapshot {args.finalize_review} -->")
+        return 0
+    sessions = collect_sessions(args.source, state, args.lookback_days, args.legacy_message_chars or args.max_message_chars)
     if not sessions:
         print("# No New Chat History\n\nNo unreviewed Copilot or Codex sessions were found in the selected window.")
         return 0
@@ -484,10 +602,13 @@ def main() -> int:
         print(format_session_markdown(session))
         print("---\n")
     if args.mark_reviewed:
-        state = load_review_state(args.state_file)
         mark_reviewed(state, sessions)
         save_review_state(args.state_file, state)
         print("<!-- Marked collected transcript segments as reviewed -->")
+    elif args.prepare_review:
+        review_id = create_review_snapshot(state, sessions)
+        save_review_state(args.state_file, state)
+        print(f"<!-- Prepared review snapshot {review_id}; finalize only after the report has been delivered -->")
     return 0
 
 

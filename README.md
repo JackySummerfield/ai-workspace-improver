@@ -1,56 +1,86 @@
 # AI Workspace 自我改进
 
-`ai-workspace-improver` 是一个保守的 AI workspace 复盘 skill。它从本地
-Copilot 与 Codex 对话的有限摘要中提取证据，再结合确定性的 workspace 检查，持续改进
-skill、知识库、agent 与共享规则。
+中文 · [English](README.en.md)
 
-## 能做什么
+`ai-workspace-improver` 是面向个人 AI workspace 的本地优先治理 skill：它复盘
+Copilot 与 Codex 会话，检查 token 覆盖、运行摩擦、skills、共享规则、个人知识库与
+workspace 结构，并只提出有证据的改进建议。
 
-- 采集未审阅的本地 Copilot 与 Codex JSONL 历史。首次复盘查看最近 90 天，之后只处理增量；同一 Codex session ID 的多个 rollout 文件只算一个逻辑会话。
-- 在进入复盘前限制每条消息长度、遮蔽常见密钥；绝不把原始对话写入仓库、知识库、报告或审阅状态。
-- 仅按 `workspace.toml` 盘点受管理的 AI 资产，不扫描机器上的无关文件。
-- 通过 `ai-workspace status`、`doctor`、`apply --dry-run` 和单元测试形成 workspace 诊断证据。
-- 先呈现有证据、改动最小的建议；只有你逐项选择后才会实施。
-- 每项批准改动在 5 次相关逻辑会话或 30 天后（先到者）复查效果；调整与回退始终需要你确认。
+## 为什么做这个
 
-它不会启动后台服务或定时任务，不会给代码打主观分数，也不会自动 reset、提交、推送或静默修复。
+会话历史能暴露失败重试、工具缺口、触发词遗漏和知识沉淀机会；同时，规则、skills 和
+wiki 会随使用累积而产生错位、冗余和陈旧路径。本 skill 将两者放进同一个保守闭环，避免
+“能采集会话”被误当作“资产健康”。
 
-## 快速开始
+## 能力与边界
 
-在 AI 助手中输入 `每日回顾`、`自我改进`、`技能优化` 或 `工作区诊断`。skill 会先完成复盘并展示发现，再等待你选择要实施的项目。
+| 能力 | 说明 |
+| --- | --- |
+| 跨工具会话 | 采集本地 Copilot/Codex 增量；Codex rollout 按逻辑会话归并 |
+| 完整交付 | 审查结果必须直接展示在当前对话；本地 Markdown 仅作副本 |
+| Token 覆盖 | 可选读取已安装的 `ccusage`；绝不自动安装或伪造 Copilot 成本 |
+| 运行摩擦 | 汇总 sandbox、网络、工具失败和权限升级类别，不保存原始输出 |
+| 资产健康 | 每次轻量检查；每 5 次完成审查或显式 `assets` 时执行深度审计 |
+| 安全变更 | 所有资产/Git 改动都需逐项选择；不会自动提交、推送或启动服务 |
 
-也可以直接查看采集结果：
+PlantSim 帮助库属于 agent 附属资产，只检查索引与检索结构；它不是个人知识库，也不会被
+整体读入上下文。
 
-```bash
-python scripts/collect_chat_history.py --source all --lookback-days 90
+## 使用方式
+
+在助手中输入 `每日回顾`、`自我改进`、`技能优化`、`token分析`、`工作区诊断` 或
+`资产审计`。可选焦点：`conversations`、`tokens`、`assets`、`workspace`。
+
+```mermaid
+flowchart LR
+  A[创建会话快照] --> B[轻量健康与覆盖检查]
+  B --> C[直接展示完整报告]
+  C --> D{用户选择/结束}
+  D -->|批准| E[预检、最小修改、验证]
+  D -->|确认结束| F[只推进快照游标]
+  E --> F
 ```
 
-支持 `copilot`、`codex` 和 `all` 三种来源。显示数量为逻辑会话；`--mark-reviewed` 仍只推进底层 transcript 文件段游标，应在报告已展示后再使用。
+## 报告示例
 
-## 建议门槛
+```markdown
+## Review summary
+- Sources: Copilot 3 logical sessions; Codex 7 logical sessions (12 segments)
+- Snapshot: review-...; not yet finalized
 
-- 调整 skill、agent 或全局规则：同一模式必须出现在两个独立会话中，或存在一个可明确预防的直接失败。
-- 知识候选必须是已验证、可长期复用的事实。
-- workspace 修复必须来自确定性检查，优先复用现有 `ai-workspace` 命令，不再新造修复工具。
+## Runtime incidents
+- sandbox_permission ×2; recovered after approved escalation
 
-## 效果复查
+## Token coverage
+- ccusage: unavailable; Copilot Chat exact token coverage unavailable
 
-每项批准改动都会在本地 `skill_change_log.md` 记录基线、预期效果、可观察信号和“相关会话”的定义。到复查节点后，结论为保留、调整、回退或证据不足；后两类始终只是建议，不会自动改动资产。
+## Asset health
+- Errors: none
+- Warnings: one global-rule scope candidate
 
-## 隐私与本地状态
+## Findings
+### F-03 — Move workspace publication policy out of global guidance
+- Evidence: deterministic lint warning and inspected guidance
+- Smallest change: move the project-only rule to root AGENTS.md
+- Status: PENDING
+```
 
-以下已被忽略的文件只保存在本地：`review_state.json`、`reviews/`、
-`deferred_opportunities.md`、`skill_change_log.md`。它们保存游标、脱敏发现和审批记录，
-不保存原始对话。
+## Token 数据限制
 
-如果某个来源目录缺失或 transcript 格式变更，skill 会报告该来源降级，并继续使用可用来源和 workspace 诊断。
+`ccusage` 是可选本地工具。skill 只检测已安装的二进制；若缺失，会报告覆盖缺口与人工
+安装建议，不下载软件。只有 session ID 精确匹配的 token 数据才能归因到会话、项目或
+显式触发的 skill。Copilot Chat 没有原生 usage 时仅显示消息体量代理，绝不显示估算成本。
 
-## 开发
+## 本地状态与隐私
 
-运行采集器测试：
+`review_state.json`、`reviews/`、`skill_change_log.md` 和 token 聚合摘要均被 Git
+忽略。它们只保存游标、快照、脱敏发现和聚合指标；不会保存原始聊天、命令或工具输出。
+
+## 开发与迁移
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-测试只可使用合成 fixture；不得把真实聊天记录加入测试或文档。
+运行 workspace 检查：`bin/ai-workspace lint --json`。修改本 skill 前请先阅读
+[能力迁移矩阵](references/migration-matrix.md)：迁移必须明确保留、替换或废弃每项能力。

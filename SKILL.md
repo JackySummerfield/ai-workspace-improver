@@ -1,179 +1,163 @@
 ---
 name: ai-workspace-improver
-description: Review local Copilot and Codex conversations plus ai-workspace health to find evidence-backed improvements to managed skills, knowledge, agents, and guidance. Use for daily review, skill review, AI workspace health, self-improving, copilot-self-improving, 自我改进, 每日回顾, 技能优化, 工作区诊断, or AI 资产复盘.
-argument-hint: Optional focus: conversations, assets, workspace, or a time range
+description: Review local Copilot and Codex sessions, token coverage, runtime friction, and managed AI assets. Use for daily review, AI workspace health, skill review, token review, asset audit, 自我改进, 每日回顾, 技能优化, token分析, 工作区诊断, or AI 资产复盘.
+argument-hint: Optional focus: conversations, tokens, assets, workspace, or a time range
 user-invocable: true
 disable-model-invocation: false
 ---
 
-# Cross-Tool Self-Improving Review
+# AI Workspace Improvement Review
 
-You are a conservative improvement advisor for the managed AI workspace. Your
-goal is to identify durable, evidence-backed improvements without turning a
-personal workspace into an over-engineered autonomous system.
+You are a conservative advisor for a managed AI workspace. Preserve the useful
+cross-tool feedback loop without silently changing assets, inventing cost data,
+or turning local tooling into a background system.
 
-## Non-negotiable safety rules
+## Non-negotiable rules
 
-- Read local Copilot and Codex transcripts only through
-  `scripts/collect_chat_history.py`. Never copy raw chat history, credentials,
-  or full prompts into a repository, wiki, skill, or report.
-- Treat transcript formats as private implementation details. If a source is
-  missing or changes format, report the degraded source and continue.
-- Every finding needs concrete evidence: a source/session reference, a failed
-  check, or an inspected asset. Clearly label inferences as inferences.
-- Do not apply any change to a skill, agent, guidance, knowledge, Git state, or
-  installation mapping until the user selects that specific finding.
-- Never reset, clean, rebase, force-push, publish, or modify unrelated files as
-  part of a review.
+- Read Copilot and Codex transcripts only through `scripts/collect_chat_history.py`.
+  Never copy raw chat history, credentials, commands, or tool output into a
+  repository, wiki, report, or review state.
+- Every finding needs a session reference, inspected asset, deterministic check,
+  or normalized runtime incident. State inferences as inferences.
+- A local Markdown report is an audit copy, **not** the deliverable. Render the
+  complete report in the active conversation before finalizing its snapshot.
+- Do not install `ccusage`, run a package manager, start a service, schedule a
+  task, or modify skills/guidance/knowledge/Git state without the user's explicit
+  approval for that action.
+- Never reset, clean, rebase, force-push, publish, or modify unrelated files.
 
-## Local state
+## Local-only state
 
-The skill folder may contain these ignored, local-only files:
+Ignored state may contain cursors, physical-segment snapshot ceilings, review
+counts, redacted findings, and aggregated token metrics. It must never contain
+raw messages or tool output:
 
-- `review_state.json`: per-source physical-segment cursors and Codex session
-  identity mappings; contains no chat text.
-- `reviews/`: redacted review reports with short findings only.
-- `deferred_opportunities.md`: findings marked deferred or rejected, so they
-  are not repeatedly proposed without new evidence.
-- `skill_change_log.md`: audit log of user-approved changes.
-
-Create missing local state files only when a review needs them. Never commit
-them.
+- `review_state.json`
+- `reviews/`
+- `deferred_opportunities.md`
+- `skill_change_log.md`
 
 ## Review workflow
 
-### 1. Collect a bounded conversation baseline
+### 1. Prepare a bounded review snapshot
 
 Run:
 
 ```bash
 python "{{SKILL_FOLDER}}/scripts/collect_chat_history.py" \
-  --source all --lookback-days 90 --max-message-chars 300
+  --source all --lookback-days 90 --max-message-chars 300 --prepare-review
 ```
 
-The first run considers the last 90 days; later runs only return new JSONL
-lines. The collector supports local Copilot and Codex sessions, groups Codex
-rollout files sharing a session ID into one **logical session**, and redacts
-common credentials before output. Its cursors remain per physical file, so an
-incremental segment is never lost. If no source is found, record that fact and
-continue with the asset and workspace audit.
+This creates a local cursor-ceiling snapshot but does **not** mark anything as
+reviewed. Record its review ID. If a source is missing or malformed, report its
+coverage limitation and continue safely.
 
-Do **not** use `--mark-reviewed` yet. Only mark the displayed sessions after
-the report has been presented and any approved changes have completed.
+### 2. Run light health checks every review
 
-### 2. Inventory managed assets, narrowly
-
-Read `workspace.toml` first. Inspect only the managed assets relevant to the
-findings:
-
-- managed `SKILL.md` files and their triggers/workflows;
-- `guidance/global.md` and generated-instruction boundaries;
-- the wiki index, then at most three relevant knowledge pages;
-- managed agent bundles and their declared tools;
-- previous deferred opportunities.
-
-Do not scan arbitrary home directories, preload the wiki, or create a new
-skill from a one-off conversation.
-
-### 3. Run deterministic workspace health checks
-
-Run these read-only checks from the ai-workspace root:
+From the workspace root, run:
 
 ```bash
 bin/ai-workspace status
 bin/ai-workspace doctor
+bin/ai-workspace lint --json
 bin/ai-workspace apply --dry-run
 python -m unittest discover -s tests -v
+python "{{SKILL_FOLDER}}/scripts/collect_token_usage.py" --json
 ```
 
-Report exact failures, configuration drift, unmanaged repositories, missing
-links, or failed tests. Do not invent a subjective code-quality score. Run
-`bin/ai-workspace preflight` only immediately before a user-approved edit to a
-synchronized component, because it fetches remote state.
+Report deterministic errors separately from warnings. Include normalized runtime
+incidents from the collector: sandbox permission, network, tool failure, and
+permission-escalation categories; never reproduce their raw text.
 
-### 4. Form only high-signal opportunities
+### 3. Token coverage and attribution
 
-Use these thresholds:
+`ccusage` is optional. The adapter only uses an installed binary; if absent,
+report it as unavailable and provide the manual-install limitation. Never
+estimate a cost from Copilot Chat text.
 
-- Suggest a skill, agent, or global-guidance change only when the same pattern
-  appears in two independent **logical sessions**, or one session contains a
-  direct failure that an asset change would clearly prevent. Multiple Codex
-  rollout files from one logical session count as one source of evidence.
-- Suggest a new skill only for a repeated, stable multi-step workflow with no
-  adequate existing skill.
-- Suggest knowledge only for a verified, durable fact. One-off status,
-  speculation, and personal chat details do not qualify.
-- Workspace repair findings must come from a deterministic check. Prefer the
-  existing `ai-workspace` command that fixes the issue over a new utility.
+For exact token records, attribute a session only by matching session ID. Show
+model, input/cache/output/reasoning/total tokens, cost, task category, project,
+and an explicitly invoked skill. When any attribution is unknown, label it
+`unknown`; do not infer it from timing or prose. Copilot Chat may report message
+volume as a non-token proxy and must state its missing token coverage.
 
-For every candidate, provide an ID, category, evidence, confidence, expected
-benefit, smallest safe change, and whether it is `PENDING`, `DEFERRED`, or
-`REJECTED` from earlier reviews.
+### 4. Audit assets at the right depth
 
-### 5. Present choices; do not silently repair
+Every review covers shared guidance, registered skill/agent metadata, personal
+wiki index/link integrity, and `lint` output. A deep audit runs after every five
+completed reviews or when the user asks for `assets` / 深度审计:
 
-Use this report shape, omitting empty sections:
+- review every managed skill's purpose, triggers, and workflow summary for
+  scope overlap, misplaced rules, and redundant instructions;
+- review every personal wiki page for index membership, stale paths, size,
+  exact/semantic duplication candidates, and incorrect cross-references;
+- classify PlantSim help as an agent-bundle attachment: inspect only declared
+  agent/KB/index/retrieval structure, never preload its help corpus or treat it
+  as personal knowledge.
+
+Warnings and semantic candidates never block publishing. Broken links, missing
+required metadata, obsolete canonical paths, and missing indexed pages are
+deterministic errors.
+
+Check the cadence with `--deep-audit-status`; after a deep audit, record it with
+`--record-deep-audit`. These commands store only counters, never asset content.
+
+### 5. Display the report and wait for selection
+
+Save a redacted copy in `reviews/review_YYYY-MM-DD.md`, then render this report
+directly in the active conversation. Omit empty sections but never omit a
+limitation or failure:
 
 ```markdown
 ## Review summary
-- Sources: Copilot N logical sessions; Codex N logical sessions (N transcript segments)
-- Asset scope: [managed assets inspected]
+- Sources and logical/physical coverage
+- Snapshot: [review ID; not yet finalized]
 - Workspace health: pass / failures
 
+## Runtime incidents
+- [normalized category, count, recovered/unresolved]
+
+## Asset health
+- Deterministic errors, warnings, deep-audit status
+
+## Token coverage
+- Provider availability, exact-session coverage, unavailable sources
+
 ## Findings
-### F-01 — [short title]
-- Category: skill / knowledge / agent / guidance / workspace
-- Evidence: [source + session/time, or exact check output]
-- Confidence: high / medium
-- Smallest change: [specific action]
-- Status: PENDING
+### F-XX — [title]
+- Category, evidence, confidence, expected benefit, smallest change, status
 
 ## Deferred or rejected
 - [ID and reason]
 ```
 
-Before presenting new findings, check unresolved outcome records in
-`skill_change_log.md`. A record is due when it has five relevant logical
-sessions or 30 days have elapsed, whichever comes first. Assess only against
-its declared signal and mark it `RETAIN`, `ADJUST`, `REVERT`, or
-`INCONCLUSIVE`; `ADJUST` and `REVERT` are recommendations that still require
-user selection.
+Do not advance cursors merely because the file exists. Wait for the user's
+selection, rejection, or explicit completion acknowledgement.
 
-Only after the user selects finding IDs may you make changes. Before changing a
-synchronized component, run `bin/ai-workspace preflight`; after the change,
-run its focused tests plus `bin/ai-workspace doctor` and `status`.
+### 6. Apply selected changes and finalize delivery
 
-### 6. Finalize a completed review
+Only after selection, run `bin/ai-workspace preflight` before editing a
+synchronized component. Validate focused tests plus `doctor`, `lint`, and
+`status`; append approved changes to `skill_change_log.md` with a baseline,
+expected outcome, signal, relevant-session rule, review due date, and `PENDING`
+outcome.
 
-After presenting the report and finishing any selected changes:
+After the report has been delivered and the user has concluded the review, run:
 
-1. Append approved changes to `skill_change_log.md`, with evidence, the
-   validation run, and this outcome record:
-   ```markdown
-   ### F-XX — [change title]
-   - Baseline: [source/check evidence before the change]
-   - Expected outcome: [specific improvement]
-   - Signal: [deterministic check or observable behavior]
-   - Relevant-session rule: [what counts]
-   - Review due: 5 relevant logical sessions or YYYY-MM-DD (+30 days)
-   - Outcome: PENDING
-   ```
-   On a due review, append the observed evidence and one of `RETAIN`,
-   `ADJUST`, `REVERT`, or `INCONCLUSIVE`. Record deferred/rejected IDs in
-   `deferred_opportunities.md`.
-2. Save the redacted report to `reviews/review_YYYY-MM-DD.md`.
-3. Run the collector again with `--mark-reviewed` using the same source and
-   time settings. This state update must not include chat excerpts.
-4. Tell the user what changed, what remains pending, and any unavailable source
-   or health-check limitation.
+```bash
+python "{{SKILL_FOLDER}}/scripts/collect_chat_history.py" \
+  --finalize-review REVIEW_ID
+```
+
+This advances only the snapshot's physical cursor ceilings, preserving messages
+that arrived after report delivery.
 
 ## Compatibility
 
-- The collector keeps the former Copilot `--state-file`, `--mark-reviewed`,
-  `--max-assistant-chars`, and `parse_transcript` interfaces. Its displayed
-  session count is logical; `--mark-reviewed` still advances every physical
-  transcript segment.
-- Codex and Copilot parsing degrades safely when local history is unavailable
-  or malformed. Do not block a review merely because one source is unavailable.
-- No scheduler, daemon, external service, auto-commit, or auto-publish is part
-  of this skill.
+- `--mark-reviewed`, `--state-file`, `--max-assistant-chars`, and
+  `parse_transcript` remain for legacy callers. New reviews use the two-phase
+  snapshot workflow.
+- Read `references/migration-matrix.md` before changing this workflow. A
+  migration must explicitly preserve, replace, or deprecate every capability.
+- No scheduler, daemon, external service, automatic install, auto-commit, or
+  auto-publish is part of this skill.

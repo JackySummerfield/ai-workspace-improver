@@ -1,76 +1,88 @@
-# AI Workspace Self-Improving
+# AI Workspace Improver
 
-`ai-workspace-improver` is a conservative review skill for a managed AI
-workspace. It learns from bounded, local Copilot and Codex conversation
-excerpts, then combines that evidence with deterministic workspace checks to
-improve skills, knowledge, agents, and shared guidance over time.
+[中文](README.md) · English
 
-## What it does
+`ai-workspace-improver` is a local-first governance skill for a personal AI
+workspace. It reviews Copilot and Codex sessions alongside token coverage,
+runtime friction, skills, shared guidance, personal knowledge, and workspace
+structure, then proposes only evidence-backed improvements.
 
-- Collects unreviewed local Copilot and Codex JSONL history. A first review
-  considers the last 90 days; later reviews are incremental. Multiple Codex
-  rollout files with one session ID are one logical review session.
-- Redacts common credentials and bounds every message before it reaches the
-  review. Raw transcripts are never copied into the repository, wiki, reports,
-  or review state.
-- Audits managed assets from `workspace.toml`, not arbitrary files on the
-  machine.
-- Uses `ai-workspace status`, `doctor`, `apply --dry-run`, and unit tests as
-  evidence for workspace findings.
-- Presents small, evidence-backed changes for explicit user selection.
-- Reviews each approved change after five relevant logical sessions or 30 days,
-  whichever comes first; adjustments and reversions always remain user-approved.
+## Why
 
-It does not run a daemon, schedule itself, make subjective code-quality
-scores, reset Git state, commit, push, or silently repair assets.
+Conversation history reveals retry loops, missing tools, trigger gaps, and
+knowledge opportunities. Guidance, skills, and wikis also accumulate misplaced,
+duplicated, or stale instructions. This skill audits both sides so session
+collection is not mistaken for asset health.
 
-## Quick start
+## Capabilities and boundaries
 
-Ask your AI assistant for `daily review`, `self-improving`, or `AI workspace
-health`. The skill runs the review workflow and presents findings before making
-any change.
+| Capability | Behavior |
+| --- | --- |
+| Cross-tool sessions | Incremental local Copilot/Codex collection; Codex rollouts become logical sessions |
+| Delivered report | The complete result is rendered in the active conversation; Markdown is an audit copy |
+| Token coverage | Optionally reads an already-installed `ccusage`; never auto-installs or invents Copilot cost |
+| Runtime friction | Summarizes sandbox, network, tool-failure, and escalation categories without raw output |
+| Asset health | Light checks every review; deep audit every five completed reviews or explicit `assets` focus |
+| Safe changes | Every asset/Git change requires selection; no daemon, commit, push, or silent repair |
 
-The collector can also be inspected directly:
+PlantSim help is an agent attachment. The skill checks only its declaration,
+index, and retrieval structure; it is not treated as personal knowledge or
+preloaded into context.
 
-```bash
-python scripts/collect_chat_history.py --source all --lookback-days 90
+## Usage
+
+Ask for `daily review`, `self-improving`, `skill review`, `token review`,
+`workspace health`, or `asset audit`. Optional focus: `conversations`,
+`tokens`, `assets`, or `workspace`.
+
+```mermaid
+flowchart LR
+  A[Prepare session snapshot] --> B[Run light health and coverage checks]
+  B --> C[Render complete report in conversation]
+  C --> D{User selection or completion}
+  D -->|Approve| E[Preflight, minimal change, validation]
+  D -->|Complete| F[Advance snapshot cursors only]
+  E --> F
 ```
 
-Supported sources are `copilot`, `codex`, and `all`. `--mark-reviewed` advances
-only physical transcript-segment cursors and should be used after the review
-has been shown. The displayed count is the safer logical-session count.
+## Report example
 
-## Evidence thresholds
+```markdown
+## Review summary
+- Sources: Copilot 3 logical sessions; Codex 7 logical sessions (12 segments)
+- Snapshot: review-...; not yet finalized
 
-- Skill, agent, and guidance changes require a repeated pattern in two
-  independent sessions, or one direct failure with a clear preventative change.
-- A knowledge candidate must be a verified and durable fact.
-- A workspace repair must come from a deterministic check. Existing
-  `ai-workspace` commands are preferred to new repair utilities.
+## Runtime incidents
+- sandbox_permission ×2; recovered after approved escalation
 
-## Outcome review
+## Token coverage
+- ccusage: unavailable; Copilot Chat exact token coverage unavailable
 
-Every approved change records its baseline, expected outcome, observable
-signal, and definition of a relevant session in the local `skill_change_log.md`.
-At the review deadline it is retained, adjusted, reverted, or marked
-inconclusive. The latter two are recommendations, never automatic changes.
+## Asset health
+- Errors: none
+- Warnings: one global-rule scope candidate
+```
+
+## Token limitations
+
+`ccusage` is optional and local. The skill only detects an installed binary;
+when unavailable it reports the coverage gap and a manual-install hint. Usage
+is attributed to a session, project, or explicitly invoked skill only when the
+session ID matches exactly. Copilot Chat without native usage data receives a
+message-volume proxy, never an estimated cost.
 
 ## Privacy and local state
 
-The following ignored files are local-only: `review_state.json`, `reviews/`,
-`deferred_opportunities.md`, and `skill_change_log.md`. They contain cursors,
-redacted findings, and approval history—not raw conversations.
+`review_state.json`, `reviews/`, `skill_change_log.md`, and token aggregates
+are Git-ignored. They contain cursor ceilings, snapshots, redacted findings,
+and aggregate metrics—never raw chat, commands, or tool output.
 
-If a transcript format or source directory is unavailable, the skill reports a
-degraded source and continues with the available sources and workspace audit.
-
-## Development
-
-Run the collector tests with:
+## Development and migration
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-The parser uses synthetic fixtures only; do not add real chat transcripts to
-tests or documentation.
+Run workspace checks with `bin/ai-workspace lint --json`. Before changing the
+skill, read the [capability migration matrix](references/migration-matrix.md):
+every migration must explicitly preserve, replace, or deprecate each capability.

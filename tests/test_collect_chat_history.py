@@ -131,7 +131,7 @@ class CollectorTests(unittest.TestCase):
     def test_v2_and_legacy_state_migrate_to_segment_cursors(self):
         v2 = COLLECTOR.normalize_state({"schema_version": 2, "sources": {"codex": {"reviewed_sessions": {"old": 12}}}})
         legacy = COLLECTOR.normalize_state({"reviewed_sessions": {"legacy": 8}, "last_review": "then"})
-        self.assertEqual(v2["schema_version"], 3)
+        self.assertEqual(v2["schema_version"], 5)
         self.assertEqual(v2["sources"]["codex"]["reviewed_segments"], {"old": 12})
         self.assertEqual(v2["sources"]["codex"]["segment_sessions"], {})
         self.assertEqual(legacy["sources"]["copilot"]["reviewed_segments"], {"legacy": 8})
@@ -149,6 +149,39 @@ class CollectorTests(unittest.TestCase):
             write_jsonl(second, [])
             os.utime(second, (second.stat().st_atime + 5, second.stat().st_mtime + 5))
             self.assertEqual(COLLECTOR.discover_copilot_files([root]), [second])
+
+    def test_snapshot_finalizes_only_captured_cursor_ceiling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            transcript = Path(directory) / "rollout.jsonl"
+            write_jsonl(transcript, codex_segment("codex-1", "2026-07-01T10:00:00Z", "private first"))
+            state = COLLECTOR.default_state()
+            reviews = COLLECTOR.collect_sessions("codex", state, 90, 300, codex_files=[transcript])
+            review_id = COLLECTOR.create_review_snapshot(state, reviews)
+            self.assertEqual(state["sources"]["codex"]["reviewed_segments"], {})
+            with transcript.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"type": "response_item", "timestamp": "2026-07-01T10:03:00Z", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "later"}]}}) + "\n")
+            self.assertTrue(COLLECTOR.finalize_review_snapshot(state, review_id))
+            self.assertEqual(state["sources"]["codex"]["reviewed_segments"]["rollout"], 2)
+            incremental = COLLECTOR.collect_sessions("codex", state, 90, 300, codex_files=[transcript])
+            self.assertEqual([item.content for item in incremental[0].messages], ["later"])
+
+    def test_runtime_incidents_are_classified_without_tool_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            transcript = Path(directory) / "rollout.jsonl"
+            write_jsonl(transcript, codex_segment("codex-1", "2026-07-01T10:00:00Z", "review") + [
+                {"type": "response_item", "timestamp": "2026-07-01T10:01:00Z", "payload": {"type": "function_call_output", "output": "Operation not permitted: sandbox"}},
+            ])
+            segment = COLLECTOR.parse_codex_transcript(transcript, 300)
+            assert segment
+            self.assertEqual([item.category for item in segment.runtime_incidents], ["sandbox_permission"])
+            self.assertNotIn("Operation not permitted", repr(segment.runtime_incidents))
+
+    def test_deep_audit_is_due_on_every_fifth_completed_review(self):
+        state = COLLECTOR.default_state()
+        state["completed_reviews"] = 4
+        self.assertTrue(COLLECTOR.deep_audit_status(state)["due"])
+        COLLECTOR.record_deep_audit(state)
+        self.assertFalse(COLLECTOR.deep_audit_status(state, include_current_review=False)["due"])
 
 
 if __name__ == "__main__":
