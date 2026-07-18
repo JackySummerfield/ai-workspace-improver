@@ -12,13 +12,14 @@ import hashlib
 import json
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 
-STATE_VERSION = 5
+STATE_VERSION = 6
 SOURCES = ("copilot", "codex")
 DEFAULT_MAX_MESSAGE_CHARS = 300
 
@@ -35,7 +36,12 @@ class RuntimeIncident:
     """A privacy-safe classification of tool friction, never raw tool output."""
 
     category: str
-    recovered: bool = False
+    outcome: str = "unknown"
+
+    @property
+    def recovered(self) -> bool:
+        """Compatibility view for callers that require confirmed recovery."""
+        return self.outcome == "recovered"
 
 
 @dataclass
@@ -79,6 +85,9 @@ class ReviewSession:
     messages: list[Message]
     tools_used: set[str]
     runtime_incidents: list[RuntimeIncident]
+    task_category: str = "unknown"
+    task_category_confidence: str = "unknown"
+    explicit_skills: set[str] = field(default_factory=set)
 
     @property
     def segment_count(self) -> int:
@@ -148,14 +157,52 @@ def classify_runtime_incidents(value: Any) -> list[RuntimeIncident]:
         return []
     incidents: list[RuntimeIncident] = []
     if any(marker in text for marker in ("operation not permitted", "permission denied", "sandbox")):
-        incidents.append(RuntimeIncident("sandbox_permission"))
+        incidents.append(RuntimeIncident("sandbox_permission", "unresolved"))
     if any(marker in text for marker in ("fetch failed", "dns", "network is unreachable", "could not resolve", "connection refused")):
-        incidents.append(RuntimeIncident("network"))
+        incidents.append(RuntimeIncident("network", "unresolved"))
     if "require_escalated" in text or ("approval" in text and "permission" in text):
-        incidents.append(RuntimeIncident("permission_escalation", recovered=True))
+        incidents.append(RuntimeIncident("permission_escalation", "escalated"))
     if any(marker in text for marker in ("exit code", "non-zero", "command failed")):
-        incidents.append(RuntimeIncident("tool_failure"))
+        incidents.append(RuntimeIncident("tool_failure", "unresolved"))
     return incidents
+
+
+EXPLICIT_SKILL_PATTERNS = (
+    re.compile(r"\$([a-z][a-z0-9-]{1,63})\b", re.IGNORECASE),
+    re.compile(r"\[\$?([a-z][a-z0-9-]{1,63})\]\([^)]*/skills/[a-z0-9-]+/SKILL\.md[^)]*\)", re.IGNORECASE),
+)
+TASK_CATEGORY_PATTERNS = (
+    ("token-analysis", re.compile(r"\btoken(?:s)?\b|token分析|用量分析", re.IGNORECASE)),
+    ("workspace-governance", re.compile(r"ai[ -]?workspace|workspace health|asset audit|daily review|self[- ]improv|自我改进|每日回顾|工作区诊断|资产审计", re.IGNORECASE)),
+    ("skill-development", re.compile(r"\bskill\b|技能优化|skill开发", re.IGNORECASE)),
+    ("documentation", re.compile(r"\breadme\b|\bdocs?\b|文档", re.IGNORECASE)),
+    ("setup-installation", re.compile(r"\binstall(?:ation)?\b|\bsetup\b|安装|配置", re.IGNORECASE)),
+    ("software-development", re.compile(r"\bimplement\b|\bdebug\b|\bfix\b|\btest\b|实现|修复|测试", re.IGNORECASE)),
+)
+
+
+def derive_review_metadata(messages: Iterable[Message]) -> tuple[str, str, set[str]]:
+    """Use explicit user text only; never infer a skill from timing or context."""
+    user_text = "\n".join(item.content for item in messages if item.role == "user")
+    skills = {
+        match.group(1).lower()
+        for pattern in EXPLICIT_SKILL_PATTERNS
+        for match in pattern.finditer(user_text)
+    }
+    matched_categories = [category for category, pattern in TASK_CATEGORY_PATTERNS if pattern.search(user_text)]
+    if not matched_categories:
+        return "unknown", "unknown", skills
+    return matched_categories[0], "heuristic", skills
+
+
+def summarize_runtime_incidents(incidents: Iterable[RuntimeIncident]) -> str:
+    counts: dict[str, Counter[str]] = {}
+    for incident in incidents:
+        counts.setdefault(incident.category, Counter())[incident.outcome] += 1
+    return ", ".join(
+        f"{category} ×{sum(outcomes.values())} ({', '.join(f'{outcome} ×{count}' for outcome, count in sorted(outcomes.items()))})"
+        for category, outcomes in sorted(counts.items())
+    )
 
 
 def default_source_state() -> dict[str, dict[str, int] | dict[str, str]]:
@@ -422,6 +469,7 @@ def aggregate_segments(segments: Iterable[Session]) -> list[ReviewSession]:
                 messages.append(message)
         start_values = [segment.start_time for segment in ordered_segments if segment.start_time]
         end_values = [segment.end_time for segment in ordered_segments if segment.end_time]
+        task_category, task_category_confidence, explicit_skills = derive_review_metadata(messages)
         reviews.append(ReviewSession(
             source=source,
             session_id=identity,
@@ -433,6 +481,9 @@ def aggregate_segments(segments: Iterable[Session]) -> list[ReviewSession]:
             messages=messages,
             tools_used=set().union(*(segment.tools_used for segment in ordered_segments)),
             runtime_incidents=[incident for segment in ordered_segments for incident in segment.runtime_incidents],
+            task_category=task_category,
+            task_category_confidence=task_category_confidence,
+            explicit_skills=explicit_skills,
         ))
     return sorted(reviews, key=lambda item: (timestamp_sort_key(item.start_time), item.source, item.session_id))
 
@@ -482,8 +533,57 @@ def mark_reviewed(state: dict[str, Any], sessions: Iterable[ReviewSession]) -> N
                 source_state["segment_sessions"][segment.state_key] = segment.session_id
 
 
-def create_review_snapshot(state: dict[str, Any], sessions: Iterable[ReviewSession]) -> str:
-    """Store only cursor ceilings so delivery can finish in a later turn."""
+def review_copy_path(state_file: str | Path, review_id: str) -> Path:
+    return Path(state_file).parent / "reviews" / f"{review_id}.md"
+
+
+def write_review_copy(state_file: str | Path, review_id: str, sessions: Iterable[ReviewSession]) -> Path:
+    """Write a metadata-only local audit copy without transcript content."""
+    session_list = list(sessions)
+    source_counts = Counter(review.source for review in session_list)
+    incidents = [incident for review in session_list for incident in review.runtime_incidents]
+    path = review_copy_path(state_file, review_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# AI Workspace Review Snapshot",
+        "",
+        f"- Snapshot: `{review_id}`",
+        f"- Prepared: {utc_now().isoformat()}",
+        f"- Logical sessions: {len(session_list)}",
+        f"- Physical transcript segments: {sum(review.segment_count for review in session_list)}",
+        f"- Sources: {', '.join(f'{source} {source_counts[source]}' for source in sorted(source_counts)) or 'none'}",
+        "- Privacy: metadata only; no messages, commands, or tool output are stored.",
+        "- Delivery: the complete review is rendered in the active conversation; this is its local audit copy.",
+        "",
+        "## Runtime incidents",
+        "",
+        f"- {summarize_runtime_incidents(incidents) if incidents else 'None observed'}",
+        "",
+        "## Attribution coverage",
+        "",
+        "- Task category and explicitly invoked skill are metadata fields. `unknown` means no explicit evidence was found.",
+        "",
+        "## Completion",
+        "",
+        "- Status: pending user selection; cursors have not advanced.",
+        "",
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def append_review_copy_completion(state_file: str | Path, snapshot: dict[str, Any]) -> None:
+    report_path = snapshot.get("report_path")
+    path = Path(state_file).parent / report_path if isinstance(report_path, str) else None
+    if not path or not path.exists():
+        return
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("- Status: delivered and finalized; cursors advanced only to the snapshot ceiling.\n")
+
+
+def create_review_snapshot(state: dict[str, Any], sessions: Iterable[ReviewSession], state_file: str | Path | None = None) -> str:
+    """Store cursor ceilings and create a redacted local audit copy when requested."""
+    session_list = list(sessions)
     captured = [
         {
             "source": review.source,
@@ -493,15 +593,19 @@ def create_review_snapshot(state: dict[str, Any], sessions: Iterable[ReviewSessi
                 for segment in review.segments
             ],
         }
-        for review in sessions
+        for review in session_list
     ]
     digest = hashlib.sha256(json.dumps(captured, sort_keys=True).encode()).hexdigest()[:12]
     review_id = f"review-{utc_now().strftime('%Y%m%d%H%M%S')}-{digest}"
-    state["pending_reviews"][review_id] = {"created_at": utc_now().isoformat(), "sessions": captured}
+    snapshot: dict[str, Any] = {"created_at": utc_now().isoformat(), "sessions": captured}
+    if state_file is not None:
+        report_path = write_review_copy(state_file, review_id, session_list)
+        snapshot["report_path"] = str(report_path.relative_to(Path(state_file).parent))
+    state["pending_reviews"][review_id] = snapshot
     return review_id
 
 
-def finalize_review_snapshot(state: dict[str, Any], review_id: str) -> bool:
+def finalize_review_snapshot(state: dict[str, Any], review_id: str, state_file: str | Path | None = None) -> bool:
     snapshot = state["pending_reviews"].pop(review_id, None)
     if not isinstance(snapshot, dict):
         return False
@@ -517,6 +621,8 @@ def finalize_review_snapshot(state: dict[str, Any], review_id: str) -> bool:
             if segment.get("session_id"):
                 source_state["segment_sessions"][segment["key"]] = segment["session_id"]
     state["completed_reviews"] += 1
+    if state_file is not None:
+        append_review_copy_completion(state_file, snapshot)
     return True
 
 
@@ -545,10 +651,9 @@ def format_session_markdown(session: ReviewSession, workspace_name: str | None =
     if session.tools_used:
         lines.append(f"- **Tools Used**: {', '.join(sorted(session.tools_used))}")
     if session.runtime_incidents:
-        counts: dict[str, int] = {}
-        for incident in session.runtime_incidents:
-            counts[incident.category] = counts.get(incident.category, 0) + 1
-        lines.append("- **Runtime incidents**: " + ", ".join(f"{name} ×{count}" for name, count in sorted(counts.items())))
+        lines.append("- **Runtime incidents**: " + summarize_runtime_incidents(session.runtime_incidents))
+    lines.append(f"- **Task category**: {session.task_category} ({session.task_category_confidence})")
+    lines.append(f"- **Explicit skills**: {', '.join(sorted(session.explicit_skills)) or 'unknown'}")
     lines.extend(["", "#### Bounded transcript excerpt", ""])
     for item in session.messages:
         label = "User" if item.role == "user" else "Assistant"
@@ -582,7 +687,7 @@ def main() -> int:
         print("<!-- Recorded deep asset audit -->")
         return 0
     if args.finalize_review:
-        if not finalize_review_snapshot(state, args.finalize_review):
+        if not finalize_review_snapshot(state, args.finalize_review, args.state_file):
             parser.error(f"unknown review snapshot: {args.finalize_review}")
         save_review_state(args.state_file, state)
         print(f"<!-- Finalized review snapshot {args.finalize_review} -->")
@@ -606,7 +711,7 @@ def main() -> int:
         save_review_state(args.state_file, state)
         print("<!-- Marked collected transcript segments as reviewed -->")
     elif args.prepare_review:
-        review_id = create_review_snapshot(state, sessions)
+        review_id = create_review_snapshot(state, sessions, args.state_file)
         save_review_state(args.state_file, state)
         print(f"<!-- Prepared review snapshot {review_id}; finalize only after the report has been delivered -->")
     return 0

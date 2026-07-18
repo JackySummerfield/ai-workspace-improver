@@ -48,9 +48,12 @@ python "{{SKILL_FOLDER}}/scripts/collect_chat_history.py" \
   --source all --lookback-days 90 --max-message-chars 300 --prepare-review
 ```
 
-This creates a local cursor-ceiling snapshot but does **not** mark anything as
-reviewed. Record its review ID. If a source is missing or malformed, report its
-coverage limitation and continue safely.
+This creates a local cursor-ceiling snapshot and a metadata-only local audit
+copy in `reviews/`, but does **not** mark anything as reviewed. Record its
+review ID. The copy never includes message bodies, commands, or tool output;
+the complete user-facing result remains the report rendered in the current
+conversation. If a source is missing or malformed, report its coverage
+limitation and continue safely.
 
 ### 2. Run light health checks every review
 
@@ -67,7 +70,9 @@ python "{{SKILL_FOLDER}}/scripts/collect_token_usage.py" --json
 
 Report deterministic errors separately from warnings. Include normalized runtime
 incidents from the collector: sandbox permission, network, tool failure, and
-permission-escalation categories; never reproduce their raw text.
+permission-escalation categories with `unresolved`, `escalated`, `recovered`,
+or `unknown` outcome. Never reproduce raw commands or errors, and do not call a
+permission request a recovery unless a later success is observed.
 
 ### 3. Token coverage and attribution
 
@@ -75,11 +80,14 @@ permission-escalation categories; never reproduce their raw text.
 report it as unavailable and provide the manual-install limitation. Never
 estimate a cost from Copilot Chat text.
 
-For exact token records, attribute a session only by matching session ID. Show
-model, input/cache/output/reasoning/total tokens, cost, task category, project,
-and an explicitly invoked skill. When any attribution is unknown, label it
-`unknown`; do not infer it from timing or prose. Copilot Chat may report message
-volume as a non-token proxy and must state its missing token coverage.
+For exact token records, attribute a session only by matching a provider's
+explicit Codex UUID; a dated rollout-storage wrapper may be removed, but never
+infer identity from timing or prose. Show model, input/cache/output/reasoning/
+total tokens, cost, task category, project, and an explicitly invoked skill.
+Task category is a labeled conservative heuristic; an invoked skill must have
+an explicit `$skill` or `SKILL.md` reference, otherwise it is `unknown`.
+Copilot Chat may report message volume as a non-token proxy and must state its
+missing token coverage.
 
 ### 4. Audit assets at the right depth
 

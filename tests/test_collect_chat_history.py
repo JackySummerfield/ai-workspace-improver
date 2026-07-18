@@ -131,7 +131,7 @@ class CollectorTests(unittest.TestCase):
     def test_v2_and_legacy_state_migrate_to_segment_cursors(self):
         v2 = COLLECTOR.normalize_state({"schema_version": 2, "sources": {"codex": {"reviewed_sessions": {"old": 12}}}})
         legacy = COLLECTOR.normalize_state({"reviewed_sessions": {"legacy": 8}, "last_review": "then"})
-        self.assertEqual(v2["schema_version"], 5)
+        self.assertEqual(v2["schema_version"], 6)
         self.assertEqual(v2["sources"]["codex"]["reviewed_segments"], {"old": 12})
         self.assertEqual(v2["sources"]["codex"]["segment_sessions"], {})
         self.assertEqual(legacy["sources"]["copilot"]["reviewed_segments"], {"legacy": 8})
@@ -174,7 +174,33 @@ class CollectorTests(unittest.TestCase):
             segment = COLLECTOR.parse_codex_transcript(transcript, 300)
             assert segment
             self.assertEqual([item.category for item in segment.runtime_incidents], ["sandbox_permission"])
+            self.assertEqual(segment.runtime_incidents[0].outcome, "unresolved")
             self.assertNotIn("Operation not permitted", repr(segment.runtime_incidents))
+
+    def test_metadata_uses_only_explicit_skill_and_conservative_category(self):
+        messages = [
+            COLLECTOR.Message("user", "[$ai-workspace-improver](/tmp/skills/ai-workspace-improver/SKILL.md) token review"),
+            COLLECTOR.Message("assistant", "No additional metadata."),
+        ]
+        category, confidence, skills = COLLECTOR.derive_review_metadata(messages)
+        self.assertEqual(category, "token-analysis")
+        self.assertEqual(confidence, "heuristic")
+        self.assertEqual(skills, {"ai-workspace-improver"})
+
+    def test_snapshot_writes_metadata_only_local_audit_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            transcript = Path(directory) / "rollout.jsonl"
+            write_jsonl(transcript, codex_segment("codex-1", "2026-07-01T10:00:00Z", "private first"))
+            state = COLLECTOR.default_state()
+            reviews = COLLECTOR.collect_sessions("codex", state, 90, 300, codex_files=[transcript])
+            state_file = Path(directory) / "review_state.json"
+            review_id = COLLECTOR.create_review_snapshot(state, reviews, state_file)
+            report = COLLECTOR.review_copy_path(state_file, review_id)
+            content = report.read_text(encoding="utf-8")
+            self.assertIn("metadata only", content)
+            self.assertNotIn("private first", content)
+            self.assertTrue(COLLECTOR.finalize_review_snapshot(state, review_id, state_file))
+            self.assertIn("delivered and finalized", report.read_text(encoding="utf-8"))
 
     def test_deep_audit_is_due_on_every_fifth_completed_review(self):
         state = COLLECTOR.default_state()

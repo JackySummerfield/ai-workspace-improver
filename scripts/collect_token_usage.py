@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 from typing import Any, Callable
 
 
 INSTALL_HINT = "Install ccusage manually, review its release, then rerun this adapter; automatic installation is disabled."
+CODEX_SESSION_UUID = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$", re.IGNORECASE)
 
 
 def _records(payload: Any) -> list[dict[str, Any]]:
@@ -33,6 +35,23 @@ def _usage(record: dict[str, Any]) -> dict[str, Any]:
     return usage if isinstance(usage, dict) else {}
 
 
+def canonical_codex_session_id(value: Any) -> str:
+    """Remove only the explicit rollout/path wrapper around a Codex UUID."""
+    session_id = str(value or "").strip()
+    if match := CODEX_SESSION_UUID.search(session_id):
+        return match.group(1).lower()
+    return session_id
+
+
+def _model(record: dict[str, Any], usage: dict[str, Any]) -> str:
+    value = record.get("model", usage.get("model", record.get("models", usage.get("models", ""))))
+    if isinstance(value, dict):
+        return ", ".join(str(key) for key in value if key)
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value if item)
+    return str(value or "")
+
+
 def normalize_ccusage(payload: Any) -> dict[str, Any]:
     """Normalize only explicit session IDs; never infer an attribution."""
     sessions = []
@@ -42,16 +61,17 @@ def normalize_ccusage(payload: Any) -> dict[str, Any]:
         session_id = next((record.get(key) for key in ("session_id", "sessionId", "id", "thread_id") if record.get(key)), "")
         metrics = {
             "input_tokens": usage.get("input_tokens", usage.get("inputTokens")),
-            "cached_input_tokens": usage.get("cached_input_tokens", usage.get("cachedInputTokens")),
+            "cached_input_tokens": usage.get("cached_input_tokens", usage.get("cachedInputTokens", usage.get("cacheReadTokens"))),
+            "cache_creation_tokens": usage.get("cache_creation_tokens", usage.get("cacheCreationTokens")),
             "output_tokens": usage.get("output_tokens", usage.get("outputTokens")),
-            "reasoning_tokens": usage.get("reasoning_tokens", usage.get("reasoningTokens")),
+            "reasoning_tokens": usage.get("reasoning_tokens", usage.get("reasoningTokens", usage.get("reasoningOutputTokens"))),
             "total_tokens": usage.get("total_tokens", usage.get("totalTokens")),
-            "cost_usd": usage.get("cost_usd", usage.get("cost")),
+            "cost_usd": usage.get("cost_usd", usage.get("cost", usage.get("costUSD"))),
         }
         if not session_id:
             unattributed += 1
             continue
-        sessions.append({"session_id": str(session_id), "model": record.get("model", usage.get("model", "")), "metrics": metrics})
+        sessions.append({"session_id": canonical_codex_session_id(session_id), "model": _model(record, usage), "metrics": metrics})
     return {
         "provider": "ccusage",
         "available": True,
