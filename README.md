@@ -1,6 +1,6 @@
 # AI Workspace 自我改进
 
-`copilot-self-improving` 是一个保守的 AI workspace 复盘 skill。它从本地
+`ai-workspace-improver` 是一个保守的 AI workspace 复盘 skill。它从本地
 Copilot 与 Codex 对话的有限摘要中提取证据，再结合确定性的 workspace 检查，持续改进
 skill、知识库、agent 与共享规则。
 

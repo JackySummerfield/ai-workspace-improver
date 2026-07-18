@@ -1,6 +1,6 @@
 # AI Workspace Self-Improving
 
-`copilot-self-improving` is a conservative review skill for a managed AI
+`ai-workspace-improver` is a conservative review skill for a managed AI
 workspace. It learns from bounded, local Copilot and Codex conversation
 excerpts, then combines that evidence with deterministic workspace checks to
 improve skills, knowledge, agents, and shared guidance over time.

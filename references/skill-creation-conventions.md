@@ -1,6 +1,6 @@
 # Skill Creation Conventions
 
-Standards for creating new skills through the `copilot-self-improving` workflow. These conventions ensure quality, portability, and safety for any skill published to a public repository.
+Standards for creating new skills through the `ai-workspace-improver` workflow. These conventions ensure quality, portability, and safety for any skill published to a public repository.
 
 ## Content Safety
 

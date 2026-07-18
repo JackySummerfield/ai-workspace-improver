@@ -1,6 +1,6 @@
 ---
-name: copilot-self-improving
-description: Review local Copilot and Codex conversations plus ai-workspace health to find evidence-backed improvements to managed skills, knowledge, agents, and guidance. Use for daily review, skill review, AI workspace health, self-improving, 自我改进, 每日回顾, 技能优化, 工作区诊断, or AI 资产复盘.
+name: ai-workspace-improver
+description: Review local Copilot and Codex conversations plus ai-workspace health to find evidence-backed improvements to managed skills, knowledge, agents, and guidance. Use for daily review, skill review, AI workspace health, self-improving, copilot-self-improving, 自我改进, 每日回顾, 技能优化, 工作区诊断, or AI 资产复盘.
 argument-hint: Optional focus: conversations, assets, workspace, or a time range
 user-invocable: true
 disable-model-invocation: false
