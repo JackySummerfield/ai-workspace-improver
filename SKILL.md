@@ -30,7 +30,8 @@ personal workspace into an over-engineered autonomous system.
 
 The skill folder may contain these ignored, local-only files:
 
-- `review_state.json`: per-source session cursors; contains no chat text.
+- `review_state.json`: per-source physical-segment cursors and Codex session
+  identity mappings; contains no chat text.
 - `reviews/`: redacted review reports with short findings only.
 - `deferred_opportunities.md`: findings marked deferred or rejected, so they
   are not repeatedly proposed without new evidence.
@@ -51,8 +52,10 @@ python "{{SKILL_FOLDER}}/scripts/collect_chat_history.py" \
 ```
 
 The first run considers the last 90 days; later runs only return new JSONL
-lines. The collector supports local Copilot and Codex sessions and redacts
-common credentials before output. If no source is found, record that fact and
+lines. The collector supports local Copilot and Codex sessions, groups Codex
+rollout files sharing a session ID into one **logical session**, and redacts
+common credentials before output. Its cursors remain per physical file, so an
+incremental segment is never lost. If no source is found, record that fact and
 continue with the asset and workspace audit.
 
 Do **not** use `--mark-reviewed` yet. Only mark the displayed sessions after
@@ -93,8 +96,9 @@ synchronized component, because it fetches remote state.
 Use these thresholds:
 
 - Suggest a skill, agent, or global-guidance change only when the same pattern
-  appears in two independent sessions, or one session contains a direct failure
-  that an asset change would clearly prevent.
+  appears in two independent **logical sessions**, or one session contains a
+  direct failure that an asset change would clearly prevent. Multiple Codex
+  rollout files from one logical session count as one source of evidence.
 - Suggest a new skill only for a repeated, stable multi-step workflow with no
   adequate existing skill.
 - Suggest knowledge only for a verified, durable fact. One-off status,
@@ -112,7 +116,7 @@ Use this report shape, omitting empty sections:
 
 ```markdown
 ## Review summary
-- Sources: Copilot N sessions; Codex N sessions
+- Sources: Copilot N logical sessions; Codex N logical sessions (N transcript segments)
 - Asset scope: [managed assets inspected]
 - Workspace health: pass / failures
 
@@ -128,6 +132,13 @@ Use this report shape, omitting empty sections:
 - [ID and reason]
 ```
 
+Before presenting new findings, check unresolved outcome records in
+`skill_change_log.md`. A record is due when it has five relevant logical
+sessions or 30 days have elapsed, whichever comes first. Assess only against
+its declared signal and mark it `RETAIN`, `ADJUST`, `REVERT`, or
+`INCONCLUSIVE`; `ADJUST` and `REVERT` are recommendations that still require
+user selection.
+
 Only after the user selects finding IDs may you make changes. Before changing a
 synchronized component, run `bin/ai-workspace preflight`; after the change,
 run its focused tests plus `bin/ai-workspace doctor` and `status`.
@@ -136,8 +147,20 @@ run its focused tests plus `bin/ai-workspace doctor` and `status`.
 
 After presenting the report and finishing any selected changes:
 
-1. Append approved changes to `skill_change_log.md`, with evidence and the
-   validation run. Record deferred/rejected IDs in `deferred_opportunities.md`.
+1. Append approved changes to `skill_change_log.md`, with evidence, the
+   validation run, and this outcome record:
+   ```markdown
+   ### F-XX — [change title]
+   - Baseline: [source/check evidence before the change]
+   - Expected outcome: [specific improvement]
+   - Signal: [deterministic check or observable behavior]
+   - Relevant-session rule: [what counts]
+   - Review due: 5 relevant logical sessions or YYYY-MM-DD (+30 days)
+   - Outcome: PENDING
+   ```
+   On a due review, append the observed evidence and one of `RETAIN`,
+   `ADJUST`, `REVERT`, or `INCONCLUSIVE`. Record deferred/rejected IDs in
+   `deferred_opportunities.md`.
 2. Save the redacted report to `reviews/review_YYYY-MM-DD.md`.
 3. Run the collector again with `--mark-reviewed` using the same source and
    time settings. This state update must not include chat excerpts.
@@ -147,7 +170,9 @@ After presenting the report and finishing any selected changes:
 ## Compatibility
 
 - The collector keeps the former Copilot `--state-file`, `--mark-reviewed`,
-  `--max-assistant-chars`, and `parse_transcript` interfaces.
+  `--max-assistant-chars`, and `parse_transcript` interfaces. Its displayed
+  session count is logical; `--mark-reviewed` still advances every physical
+  transcript segment.
 - Codex and Copilot parsing degrades safely when local history is unavailable
   or malformed. Do not block a review merely because one source is unavailable.
 - No scheduler, daemon, external service, auto-commit, or auto-publish is part

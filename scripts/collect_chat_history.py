@@ -1,11 +1,8 @@
-"""Collect bounded, unreviewed Copilot and Codex chat history.
+"""Collect bounded local Copilot and Codex history for review.
 
-The collector deliberately reads local transcripts only.  It writes no chat
-content: the optional review state contains source/session cursors only.
-
-Usage:
-    python collect_chat_history.py --source all --lookback-days 90
-    python collect_chat_history.py --source codex --mark-reviewed
+The collector separates physical JSONL transcript segments from logical review
+sessions. State stores only per-segment cursors and Codex identity mappings; it
+never stores chat content.
 """
 
 from __future__ import annotations
@@ -14,14 +11,13 @@ import argparse
 import json
 import os
 import re
-import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 
-STATE_VERSION = 2
+STATE_VERSION = 3
 SOURCES = ("copilot", "codex")
 DEFAULT_MAX_MESSAGE_CHARS = 300
 
@@ -35,9 +31,12 @@ class Message:
 
 @dataclass
 class Session:
+    """One physical JSONL transcript segment and its bounded contents."""
+
     source: str
     session_id: str
     file_path: Path
+    identity_known: bool
     start_time: str = ""
     end_time: str = ""
     workspace: str = ""
@@ -48,13 +47,35 @@ class Session:
 
     @property
     def state_key(self) -> str:
-        # Cursor keys must match discovery before Codex replaces the display ID
-        # with the session_meta identifier.
+        """Stable cursor key for the physical segment, not its logical session."""
         return self.file_path.stem
 
     @property
     def is_incremental(self) -> bool:
         return self.skip_lines > 0
+
+
+@dataclass
+class ReviewSession:
+    """One logical review unit formed from one or more transcript segments."""
+
+    source: str
+    session_id: str
+    identity_known: bool
+    segments: list[Session]
+    start_time: str
+    end_time: str
+    workspace: str
+    messages: list[Message]
+    tools_used: set[str]
+
+    @property
+    def segment_count(self) -> int:
+        return len(self.segments)
+
+    @property
+    def is_incremental(self) -> bool:
+        return any(segment.is_incremental for segment in self.segments)
 
 
 def utc_now() -> datetime:
@@ -69,6 +90,11 @@ def parse_time(value: str) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def timestamp_sort_key(value: str) -> tuple[int, datetime]:
+    parsed = parse_time(value)
+    return (0, parsed) if parsed else (1, datetime.max.replace(tzinfo=timezone.utc))
 
 
 def redact_text(value: str) -> str:
@@ -86,13 +112,11 @@ def redact_text(value: str) -> str:
 
 def bound_text(value: Any, limit: int) -> str:
     text = redact_text(str(value or "")).strip()
-    if len(text) <= limit:
-        return text
-    return text[:limit] + f"... ({len(text)} chars total)"
+    return text if len(text) <= limit else text[:limit] + f"... ({len(text)} chars total)"
 
 
 def content_to_text(content: Any) -> str:
-    """Extract text from Codex response content without retaining tool output."""
+    """Extract Codex message text without retaining tool output."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -104,30 +128,39 @@ def content_to_text(content: Any) -> str:
     return ""
 
 
+def default_source_state() -> dict[str, dict[str, int] | dict[str, str]]:
+    return {"reviewed_segments": {}, "segment_sessions": {}}
+
+
 def default_state() -> dict[str, Any]:
     return {
         "schema_version": STATE_VERSION,
-        "sources": {source: {"reviewed_sessions": {}} for source in SOURCES},
+        "sources": {source: default_source_state() for source in SOURCES},
         "last_review": None,
     }
 
 
 def normalize_state(raw: dict[str, Any] | None) -> dict[str, Any]:
-    """Migrate the original Copilot-only state shape without losing cursors."""
+    """Migrate v1/v2 cursor state to v3 physical-segment cursor state."""
     state = default_state()
     raw = raw or {}
     if isinstance(raw.get("sources"), dict):
         for source in SOURCES:
             source_state = raw["sources"].get(source, {})
-            reviewed = source_state.get("reviewed_sessions", {}) if isinstance(source_state, dict) else {}
+            if not isinstance(source_state, dict):
+                continue
+            reviewed = source_state.get("reviewed_segments", source_state.get("reviewed_sessions", {}))
             if isinstance(reviewed, dict):
-                state["sources"][source]["reviewed_sessions"] = reviewed
+                state["sources"][source]["reviewed_segments"] = reviewed
+            identities = source_state.get("segment_sessions", {})
+            if isinstance(identities, dict):
+                state["sources"][source]["segment_sessions"] = identities
     else:
         reviewed = raw.get("reviewed_sessions", {})
         if isinstance(reviewed, list):
             reviewed = {session_id: 0 for session_id in reviewed}
         if isinstance(reviewed, dict):
-            state["sources"]["copilot"]["reviewed_sessions"] = reviewed
+            state["sources"]["copilot"]["reviewed_segments"] = reviewed
     state["last_review"] = raw.get("last_review")
     return state
 
@@ -154,14 +187,13 @@ def copilot_storage_roots(home: Path | None = None) -> list[Path]:
         home / "Library" / "Application Support" / "Code" / "User",
         home / ".config" / "Code" / "User",
     ]
-    appdata = os.environ.get("APPDATA")
-    if appdata:
+    if appdata := os.environ.get("APPDATA"):
         roots.append(Path(appdata) / "Code" / "User")
     return [root for root in roots if root.exists()]
 
 
 def get_default_paths() -> tuple[str, str]:
-    """Compatibility helper retained for callers of the former Copilot collector."""
+    """Compatibility helper retained for former Copilot-only callers."""
     root = next(iter(copilot_storage_roots()), Path(os.environ.get("APPDATA", "")) / "Code" / "User")
     return str(root / "workspaceStorage"), str(root / "globalStorage")
 
@@ -232,32 +264,31 @@ def parse_copilot_transcript(path: Path, max_message_chars: int, skip_lines: int
     events, total_lines = read_jsonl(path, skip_lines)
     if not events:
         return None
-    session = Session("copilot", path.stem, path, workspace=workspace, total_lines=total_lines, skip_lines=skip_lines)
+    segment = Session("copilot", path.stem, path, True, workspace=workspace, total_lines=total_lines, skip_lines=skip_lines)
     for event in events:
         data = event.get("data", {})
         event_type = event.get("type", "")
         timestamp = str(event.get("timestamp", ""))
         if event_type == "session.start":
-            session.start_time = str(data.get("startTime", timestamp))
+            segment.start_time = str(data.get("startTime", timestamp))
         elif event_type in {"user.message", "assistant.message"}:
             content = bound_text(data.get("content", ""), max_message_chars)
             if content:
-                role = "user" if event_type == "user.message" else "assistant"
-                session.messages.append(Message(role, content, timestamp))
+                segment.messages.append(Message("user" if event_type == "user.message" else "assistant", content, timestamp))
             for request in data.get("toolRequests", []):
                 if request.get("toolName"):
-                    session.tools_used.add(str(request["toolName"]))
+                    segment.tools_used.add(str(request["toolName"]))
         elif event_type == "tool.execution_complete" and data.get("toolName"):
-            session.tools_used.add(str(data["toolName"]))
-        session.end_time = timestamp or session.end_time
-    return session if session.messages else None
+            segment.tools_used.add(str(data["toolName"]))
+        segment.end_time = timestamp or segment.end_time
+    return segment if segment.messages else None
 
 
 def parse_codex_transcript(path: Path, max_message_chars: int, skip_lines: int = 0) -> Session | None:
     events, total_lines = read_jsonl(path, skip_lines)
     if not events:
         return None
-    session = Session("codex", path.stem, path, total_lines=total_lines, skip_lines=skip_lines)
+    segment = Session("codex", "", path, False, total_lines=total_lines, skip_lines=skip_lines)
     primary_messages: list[Message] = []
     fallback_messages: list[Message] = []
     for event in events:
@@ -267,9 +298,12 @@ def parse_codex_transcript(path: Path, max_message_chars: int, skip_lines: int =
         event_type = event.get("type", "")
         timestamp = str(event.get("timestamp", ""))
         if event_type == "session_meta":
-            session.session_id = str(payload.get("session_id") or session.session_id)
-            session.start_time = str(payload.get("timestamp", timestamp))
-            session.workspace = str(payload.get("cwd", ""))
+            session_id = payload.get("session_id")
+            if session_id:
+                segment.session_id = str(session_id)
+                segment.identity_known = True
+            segment.start_time = str(payload.get("timestamp", timestamp))
+            segment.workspace = str(payload.get("cwd", ""))
         elif event_type == "response_item":
             item_type = payload.get("type")
             if item_type == "message" and payload.get("role") in {"user", "assistant"}:
@@ -277,45 +311,85 @@ def parse_codex_transcript(path: Path, max_message_chars: int, skip_lines: int =
                 if content:
                     primary_messages.append(Message(str(payload["role"]), content, timestamp))
             elif item_type in {"function_call", "custom_tool_call"} and payload.get("name"):
-                session.tools_used.add(str(payload["name"]))
+                segment.tools_used.add(str(payload["name"]))
         elif event_type == "event_msg":
             item_type = payload.get("type")
             if item_type in {"user_message", "agent_message"}:
                 content = bound_text(payload.get("message", ""), max_message_chars)
                 if content:
-                    role = "user" if item_type == "user_message" else "assistant"
-                    fallback_messages.append(Message(role, content, timestamp))
+                    fallback_messages.append(Message("user" if item_type == "user_message" else "assistant", content, timestamp))
             elif isinstance(item_type, str) and item_type.endswith("_tool_call"):
-                session.tools_used.add(item_type)
-        session.end_time = timestamp or session.end_time
-    session.messages = primary_messages or fallback_messages
-    return session if session.messages else None
+                segment.tools_used.add(item_type)
+        segment.end_time = timestamp or segment.end_time
+    segment.messages = primary_messages or fallback_messages
+    return segment if segment.messages else None
 
 
 def parse_transcript(filepath: str, max_assistant_chars: int = DEFAULT_MAX_MESSAGE_CHARS, skip_lines: int = 0) -> dict[str, Any] | None:
     """Backward-compatible Copilot parser used by older integrations."""
-    session = parse_copilot_transcript(Path(filepath), max_assistant_chars, skip_lines)
-    if not session:
-        return None
-    return session_to_legacy_dict(session)
+    segment = parse_copilot_transcript(Path(filepath), max_assistant_chars, skip_lines)
+    return session_to_legacy_dict(segment) if segment else None
 
 
-def session_to_legacy_dict(session: Session) -> dict[str, Any]:
+def session_to_legacy_dict(segment: Session) -> dict[str, Any]:
     return {
-        "session_id": session.session_id,
-        "file_path": str(session.file_path),
-        "start_time": session.start_time,
-        "end_time": session.end_time,
-        "messages": [{"role": item.role, "content": item.content, "timestamp": item.timestamp} for item in session.messages],
-        "tools_used": sorted(session.tools_used),
-        "total_lines": session.total_lines,
-        "is_incremental": session.is_incremental,
+        "session_id": segment.session_id,
+        "file_path": str(segment.file_path),
+        "start_time": segment.start_time,
+        "end_time": segment.end_time,
+        "messages": [{"role": item.role, "content": item.content, "timestamp": item.timestamp} for item in segment.messages],
+        "tools_used": sorted(segment.tools_used),
+        "total_lines": segment.total_lines,
+        "is_incremental": segment.is_incremental,
     }
 
 
 def in_lookback_window(path: Path, lookback_days: int) -> bool:
-    cutoff = utc_now() - timedelta(days=lookback_days)
-    return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc) >= cutoff
+    return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc) >= utc_now() - timedelta(days=lookback_days)
+
+
+def hydrate_segment_identity(segment: Session, identities: dict[str, str]) -> None:
+    """Recover a Codex logical identity when an incremental read skipped metadata."""
+    if not segment.identity_known and (session_id := identities.get(segment.state_key)):
+        segment.session_id = session_id
+        segment.identity_known = True
+
+
+def aggregate_segments(segments: Iterable[Session]) -> list[ReviewSession]:
+    """Group physical segments into logical sessions without joining unknown IDs."""
+    groups: dict[tuple[str, str], list[Session]] = {}
+    for segment in segments:
+        identity = segment.session_id if segment.identity_known else f"unknown:{segment.state_key}"
+        groups.setdefault((segment.source, identity), []).append(segment)
+
+    reviews: list[ReviewSession] = []
+    for (source, identity), group in groups.items():
+        ordered_segments = sorted(group, key=lambda item: timestamp_sort_key(item.start_time or item.end_time))
+        ordered_messages = sorted(
+            (message for segment in ordered_segments for message in segment.messages),
+            key=lambda item: timestamp_sort_key(item.timestamp),
+        )
+        messages: list[Message] = []
+        seen_messages: set[tuple[str, str, str]] = set()
+        for message in ordered_messages:
+            fingerprint = (message.role, message.timestamp, message.content)
+            if fingerprint not in seen_messages:
+                seen_messages.add(fingerprint)
+                messages.append(message)
+        start_values = [segment.start_time for segment in ordered_segments if segment.start_time]
+        end_values = [segment.end_time for segment in ordered_segments if segment.end_time]
+        reviews.append(ReviewSession(
+            source=source,
+            session_id=identity,
+            identity_known=not identity.startswith("unknown:"),
+            segments=ordered_segments,
+            start_time=min(start_values, key=timestamp_sort_key) if start_values else "",
+            end_time=max(end_values, key=timestamp_sort_key) if end_values else "",
+            workspace=next((segment.workspace for segment in ordered_segments if segment.workspace), ""),
+            messages=messages,
+            tools_used=set().union(*(segment.tools_used for segment in ordered_segments)),
+        ))
+    return sorted(reviews, key=lambda item: (timestamp_sort_key(item.start_time), item.source, item.session_id))
 
 
 def collect_sessions(
@@ -325,47 +399,54 @@ def collect_sessions(
     max_message_chars: int,
     copilot_roots: Iterable[Path] | None = None,
     codex_files: Iterable[Path] | None = None,
-) -> list[Session]:
+) -> list[ReviewSession]:
     selected = SOURCES if source == "all" else (source,)
-    collected: list[Session] = []
+    segments: list[Session] = []
     roots = list(copilot_roots) if copilot_roots is not None else copilot_storage_roots()
     workspace_maps = {root: load_workspace_mapping(root / "globalStorage") for root in roots}
     for provider in selected:
         files = discover_copilot_files(roots) if provider == "copilot" else list(codex_files if codex_files is not None else discover_codex_files())
-        reviewed = state["sources"][provider]["reviewed_sessions"]
+        source_state = state["sources"][provider]
+        reviewed = source_state["reviewed_segments"]
+        identities = source_state["segment_sessions"]
         for path in files:
-            session_id = path.stem
-            skip_lines = int(reviewed.get(session_id, 0))
+            skip_lines = int(reviewed.get(path.stem, 0))
             if not skip_lines and not in_lookback_window(path, lookback_days):
                 continue
-            workspace = ""
             if provider == "copilot":
                 try:
                     workspace_id = path.parents[2].name
                     workspace = next((mapping.get(workspace_id, "") for mapping in workspace_maps.values()), "")
                 except IndexError:
-                    pass
-                parsed = parse_copilot_transcript(path, max_message_chars, skip_lines, workspace)
+                    workspace = ""
+                segment = parse_copilot_transcript(path, max_message_chars, skip_lines, workspace)
             else:
-                parsed = parse_codex_transcript(path, max_message_chars, skip_lines)
-            if parsed:
-                collected.append(parsed)
-    return sorted(collected, key=lambda item: (item.start_time, item.source, item.session_id))
+                segment = parse_codex_transcript(path, max_message_chars, skip_lines)
+            if segment:
+                hydrate_segment_identity(segment, identities)
+                segments.append(segment)
+    return aggregate_segments(segments)
 
 
-def mark_reviewed(state: dict[str, Any], sessions: Iterable[Session]) -> None:
-    for session in sessions:
-        state["sources"][session.source]["reviewed_sessions"][session.state_key] = session.total_lines
+def mark_reviewed(state: dict[str, Any], sessions: Iterable[ReviewSession]) -> None:
+    for review in sessions:
+        source_state = state["sources"][review.source]
+        for segment in review.segments:
+            source_state["reviewed_segments"][segment.state_key] = segment.total_lines
+            if segment.identity_known:
+                source_state["segment_sessions"][segment.state_key] = segment.session_id
 
 
-def format_session_markdown(session: Session, workspace_name: str | None = None) -> str:
+def format_session_markdown(session: ReviewSession, workspace_name: str | None = None) -> str:
     start = parse_time(session.start_time)
     formatted = start.strftime("%Y-%m-%d %H:%M") if start else (session.start_time or "Unknown")
     incremental = " (incremental)" if session.is_incremental else ""
+    identity = f"{session.session_id[:8]}..." if session.identity_known else "identity unavailable"
     lines = [
-        f"### {session.source.title()} session: {session.session_id[:8]}...{incremental}",
+        f"### {session.source.title()} session: {identity}{incremental}",
         f"- **Time**: {formatted}",
         f"- **Workspace**: {workspace_name or session.workspace or 'Unknown'}",
+        f"- **Transcript segments**: {session.segment_count}",
         f"- **Messages**: {len(session.messages)} total ({sum(item.role == 'user' for item in session.messages)} user)",
     ]
     if session.tools_used:
@@ -378,9 +459,9 @@ def format_session_markdown(session: Session, workspace_name: str | None = None)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Collect bounded, unreviewed Copilot and Codex chat history")
+    parser = argparse.ArgumentParser(description="Collect bounded logical Copilot and Codex review sessions")
     parser.add_argument("--state-file", default=str(Path(__file__).resolve().parents[1] / "review_state.json"))
-    parser.add_argument("--mark-reviewed", action="store_true", help="Advance cursors after printing the collected sessions")
+    parser.add_argument("--mark-reviewed", action="store_true", help="Advance cursors for every collected transcript segment")
     parser.add_argument("--source", choices=("all", *SOURCES), default="all")
     parser.add_argument("--lookback-days", type=int, default=90, help="Initial-history window; later runs are incremental")
     parser.add_argument("--max-message-chars", type=int, default=DEFAULT_MAX_MESSAGE_CHARS)
@@ -388,25 +469,25 @@ def main() -> int:
     args = parser.parse_args()
     if args.lookback_days < 1 or args.max_message_chars < 1:
         parser.error("lookback and message limits must be positive")
-    max_chars = args.legacy_message_chars or args.max_message_chars
-    state = load_review_state(args.state_file)
-    sessions = collect_sessions(args.source, state, args.lookback_days, max_chars)
+    sessions = collect_sessions(args.source, load_review_state(args.state_file), args.lookback_days, args.legacy_message_chars or args.max_message_chars)
     if not sessions:
         print("# No New Chat History\n\nNo unreviewed Copilot or Codex sessions were found in the selected window.")
         return 0
     print("# Chat History Review Summary\n")
     print(f"- **Date**: {utc_now().strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"- **Sources**: {', '.join(sorted({item.source for item in sessions}))}")
-    print(f"- **Sessions**: {len(sessions)}")
+    print(f"- **Logical sessions**: {len(sessions)}")
+    print(f"- **Transcript segments**: {sum(item.segment_count for item in sessions)}")
     print(f"- **Messages**: {sum(len(item.messages) for item in sessions)}")
     print("- **Privacy**: bounded and redacted excerpts; raw transcripts are not persisted\n")
     for session in sessions:
         print(format_session_markdown(session))
         print("---\n")
     if args.mark_reviewed:
+        state = load_review_state(args.state_file)
         mark_reviewed(state, sessions)
         save_review_state(args.state_file, state)
-        print("<!-- Marked collected sessions as reviewed -->")
+        print("<!-- Marked collected transcript segments as reviewed -->")
     return 0
 
 
